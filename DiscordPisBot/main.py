@@ -3,6 +3,9 @@ from discord.ext import commands, tasks
 import logging
 from GetApiInfo.api_main import getGamesInfo
 from datetime import datetime, time
+import json
+from pathlib import Path
+import json, os, tempfile, asyncio
 
 TOKEN=''
 
@@ -14,13 +17,51 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 setdaily_target_channel = None
 
+SAVE_FILE = Path("sent_games_data.json")
 id_dict = dict()
+save_lock = asyncio.Lock()
+loop_lock = asyncio.Lock()
+
+def load_id_dict():
+    global id_dict
+
+    if SAVE_FILE.exists():
+        try:
+            with open("sent_games_data.json", "r", encoding="utf-8") as f:
+                id_dict = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            id_dict = {}
+    else:
+        id_dict = {}
+    
+def atomic_save(data:dict, path:Path):
+    dirpath = path.parent or Path('.')
+    fd, tmp_path = tempfile.mkstemp(dir=dirpath)
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmpf:
+            json.dump(data, tmpf, indent=2, ensure_ascii=False)
+            tmpf.flush()
+            os.fsync(tmpf.fileno())
+        os.replace(tmp_path, str(path))
+
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+async def save_id_dict():
+    async with save_lock:
+        atomic_save(id_dict, SAVE_FILE)
 
 @bot.event
 async def on_ready():
     print("*"*20)
     print("Bot has started")
     print("*"*20)
+    load_id_dict()
     daily_task.start()
 
 @bot.event
@@ -50,42 +91,61 @@ async def setdaily(ctx):
 @tasks.loop(minutes=1)
 async def daily_task():
     global setdaily_target_channel
+    global id_dict
 
-    if setdaily_target_channel is None:
+    if loop_lock.locked():
         return
-    
-    now = datetime.now().time()
-    today = datetime.today().weekday()
-    target = time(21,27)
 
-    if now.hour == target.hour and now.minute == target.minute:
+    async with loop_lock:
+        if setdaily_target_channel is None:
+            return
+           
+        now = datetime.now().time()
+        today = datetime.today().weekday()
+        target = time(22,52)
+
+        test_mode = False
+
+        if not test_mode:
+            if not (now.hour == target.hour and now.minute == target.minute):
+                return
+
         gamesList = getGamesInfo()
 
         for game_data in gamesList:
+        
+            game_id = str(game_data['id']) # als String für JSON-Keys
 
-            id_dict.setdefault(game_data['id'], None)
+            # Falls key nicht existiert -> get -> None
+            current = id_dict.get(game_id) # None oder Integer (0..6)
 
-            embed = discord.Embed(
-                title=game_data["title"],
-                description=f"""
+            if current is None:
+                id_dict[game_id] = today
+                await save_id_dict()
+
+                embed = discord.Embed(
+                    title=game_data["title"],
+                    description=f"""
 Стоимость: {game_data["worth"]}
 Описание: {game_data["description"]}
 Платформы: {game_data["platforms"]}
 Дата оканчания акции: {game_data["end_date"]}
 Ссылка: {game_data["open_giveaway"]}
 """,
-                colour=0x800080,)
+                    colour=0x800080,)
             
-            embed.set_image(url=game_data["thumbnail"])
+                embed.set_image(url=game_data["thumbnail"])
+                await setdaily_target_channel.send(embed=embed)
 
-            if id_dict[game_data['id']] != today:
-                id_dict[game_data['id']] = today
-                await setdaily_target_channel.send(embed=embed) 
+            elif current == today:
+                id_dict.pop(game_id, None)
+                await save_id_dict()
             else:
-                id_dict.pop(game_data['id'])
+                pass
 
 @daily_task.before_loop
 async def before_daily_task():
     await bot.wait_until_ready()
+
 
 bot.run(TOKEN, log_level=logging.DEBUG)
